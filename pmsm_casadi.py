@@ -166,6 +166,117 @@ def build_rk4_integrator_nd(f_dyn, dt, num_substeps, nx, nu):
         x_sub = rk4_step(f_dyn, x_sub, u, dt_sub)
     return ca.Function('rk4_integrator', [x, u], [x_sub], ['x', 'u'], ['x_next'])
 
+def wrap_to_2pi(theta):
+    """Wrap angle(s) into [0, 2*pi)."""
+    return np.mod(theta, 2 * np.pi)
+ 
+ 
+def plot_pmsm_results(t, theta_m_sol, omega_sol, P_sol, id_sol, iq_sol,
+                       params=None, savepath='pmsm_optimal_control.png'):
+    """
+    Produces a clean multi-panel figure:
+      1) theta_m wrapped to [0, 2*pi)
+      2) id, iq currents (with optional Imax circle context)
+      3) omega_m (speed)
+      4) P (estimation variance)
+    """
+    theta_wrapped = wrap_to_2pi(theta_m_sol)
+ 
+    fig, axs = plt.subplots(3, 1, figsize=(8, 11), sharex=True)
+    # --- id, iq ---
+    ax = axs[0]
+    ax.plot(t, id_sol, label='$i_d$', color='tab:orange')
+    ax.plot(t, iq_sol, label='$i_q$', color='tab:green')
+    if params is not None and hasattr(params, 'Imax'):
+        ax.axhline(params.Imax, color='k', linestyle='--', linewidth=0.8, alpha=0.6)
+        ax.axhline(-params.Imax, color='k', linestyle='--', linewidth=0.8, alpha=0.6,
+                    label='$\\pm I_{max}$')
+    ax.set_ylabel('Current [A]')
+    ax.set_title('Stator currents (dq frame)')
+    ax.legend(loc='upper right')
+ 
+    # --- omega_m ---
+    ax = axs[1]
+    ax.plot(t, omega_sol, color='tab:red')
+    ax.set_ylabel('$\\omega_m$ [rad/s]')
+    ax.set_title('Rotor speed')
+ 
+    # --- P (variance) ---
+    ax = axs[2]
+    ax.axhline(0, color='k', linewidth=0.5)
+    ax.plot(t, P_sol, color='tab:purple', label='$P$ (variance)')
+    ax.set_ylabel('Variance [rad$^2$]')
+    ax.set_xlabel('Time [s]')
+    ax.set_title('Estimation error covariance')
+    ax.legend(loc='upper right')
+ 
+    for a in axs:
+        a.grid(True, alpha=0.3)
+ 
+    plt.tight_layout()
+    plt.savefig(savepath, dpi=300)
+    plt.show()
+ 
+    return fig, axs
+def save_results_matlab(filepath, t=None, theta_m=None, omega_m=None, P=None,
+                         id=None, iq=None, vd=None, vq=None, fmt='%.8g',
+                         pad_duration=2.0, dt=None):
+    """
+    Writes a plain-text file with MATLAB-style row-vector assignments,
+    one variable per line, e.g.:
+ 
+        t = [0 0.1 0.2 ... 5.0];
+        theta_m = [0 0.0123 ... ];
+        id = [0 1.02 ... ];
+ 
+    Only variables passed in (not None) are written, in a fixed order.
+    Paste the file contents directly into a MATLAB script or command window.
+ 
+    Everything is shifted `pad_duration` seconds to the right: t is extended
+    with `pad_duration` seconds of additional samples starting at 0 (so the
+    original t=0 sample now lands at t=pad_duration), and every other
+    provided signal (including omega_m) is prepended with zeros over that
+    same span.
+ 
+    dt: timestep used for the padding samples. If None, inferred from t
+        (assumes uniform spacing).
+    """
+    if t is None:
+        raise ValueError("t must be provided")
+ 
+    t = np.asarray(t).ravel()
+    if dt is None:
+        dt = t[1] - t[0]
+ 
+    n_pad = int(round(pad_duration / dt))
+    t_pad = np.arange(n_pad) * dt              # [0, dt, 2dt, ..., pad_duration - dt]
+    t_shifted = np.concatenate([t_pad, t + pad_duration])
+ 
+    # Preserve a sensible, fixed variable order regardless of kwargs order
+    ordered = [
+        ('theta_m', theta_m),
+        ('omega_m', omega_m),
+        ('P', P),
+        ('id', id),
+        ('iq', iq),
+        ('vd', vd),
+        ('vq', vq),
+    ]
+ 
+    lines = [f't = [{" ".join(fmt % v for v in t_shifted)}];']
+    for name, arr in ordered:
+        if arr is None:
+            continue
+        arr = np.asarray(arr).ravel()
+        arr_padded = np.concatenate([np.zeros(n_pad), arr])
+        values_str = ' '.join(fmt % v for v in arr_padded)
+        lines.append(f'{name} = [{values_str}];')
+ 
+    with open(filepath, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+ 
+    return filepath
+
 if __name__ == "__main__":
     params = PMSMParams()
     T_HORIZON = 3.0
@@ -174,12 +285,12 @@ if __name__ == "__main__":
     RK4_SUBSTEPS = 100   # single smooth ODE, should be much less stiff than before
 
     TARGET_SPEED = params.N * 0.1
-    P0 = 1.0**2         # initial uncertainty (rad^2) — matches your old THETA_HAT_INIT_ERROR=1.0
+    P0 = 1.0**2         # initial uncertainty (rad^2)
 
     # Tunable noise/signal model
     ke = params.lambda_m * params.p          # BEMF constant, adjust to your actual definition
     sigma_base = 0.01
-    k_bemf_noise = 0.005      # <-- the "BEMF noise proportional to speed" coefficient
+    k_bemf_noise = 0.5      # <-- the "BEMF noise proportional to speed" coefficient
     k_gain = 1.0
     Q_process = 1e-4          # small floor so P never hits exactly zero (avoids /0 issues elsewhere)
 
@@ -227,23 +338,11 @@ if __name__ == "__main__":
     t = np.linspace(0, T_HORIZON, N + 1)
     theta_m_sol   = sol.value(theta_m)
     omega_sol     = sol.value(omega_m)
+    P_sol = sol.value(P)
+    id_sol = sol.value(id)
+    iq_sol = sol.value(iq)
+    vd_sol = sol.value(vd)
+    vq_sol = sol.value(vq)
+    save_results_matlab('pmsm_results.txt', t=t, omega_m=omega_sol, pad_duration=2.0)
 
-    fig, axs = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
-
-    axs[0].plot(t, theta_m_sol, label='$\\theta_m$ (true)')
-    axs[0].set_ylabel('Position [rad]')
-    axs[0].legend()
-
-    axs[1].axhline(0, color='k', linewidth=0.5)
-    axs[1].set_ylabel('$\\theta_m - \\hat{\\theta}$ [rad]')
-    axs[1].set_title('Estimation error')
-
-    axs[2].plot(t, omega_sol)
-    axs[2].set_ylabel('$\\omega_m$ [rad/s]')
-    axs[2].set_xlabel('Time [s]')
-
-    for ax in axs:
-        ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-    plt.savefig('pmsm_optimal_control.png', dpi=300)
+    plot_pmsm_results(t, theta_m_sol, omega_sol, P_sol, id_sol, iq_sol, params=params)
