@@ -171,7 +171,7 @@ if __name__ == "__main__":
     T_HORIZON = 3.0
     DT = 1e-1
     N = int(round(T_HORIZON / DT))
-    RK4_SUBSTEPS = 500   # single smooth ODE, should be much less stiff than before
+    RK4_SUBSTEPS = 100   # single smooth ODE, should be much less stiff than before
 
     TARGET_SPEED = params.N * 0.1
     P0 = 1.0**2         # initial uncertainty (rad^2) — matches your old THETA_HAT_INIT_ERROR=1.0
@@ -246,3 +246,4 @@ if __name__ == "__main__":
         ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
+    plt.savefig('pmsm_optimal_control.png', dpi=300)
