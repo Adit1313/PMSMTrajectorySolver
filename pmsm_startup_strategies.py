@@ -1,10 +1,10 @@
 """Compares startup strategies against the OCP-optimal spin-up trajectory,
 using the same uncertainty (P) model from pmsm_casadi.py.
 
-P_dot only depends on info_rate(omega_m, k_info, k_hfi) -- not on how omega_m
-was achieved -- so alternative strategies are compared by prescribing a speed
-trajectory omega_m(t) directly and integrating the same P dynamics, rather
-than re-solving an optimization problem for each one.
+P_dot only depends on info_rate(omega_m, params, sigma, k_hfi) -- not on how
+omega_m was achieved -- so alternative strategies are compared by
+prescribing a speed trajectory omega_m(t) directly and integrating the same
+P dynamics, rather than re-solving an optimization problem for each one.
 
 Strategies compared
 --------------------
@@ -49,7 +49,7 @@ T_HORIZON = 3.0
 DT = 1e-1
 RK4_SUBSTEPS = 500
 P0 = 1.0 ** 2
-K_INFO = 2e-6
+SIGMA = 20.0      # Gaussian measurement-noise standard deviation [V]
 Q_PROCESS = 1e-4
 
 # Rotor-alignment strategy
@@ -85,10 +85,10 @@ def linear_ramp_omega(t, target_speed, t_start, t_end):
 
 
 def integrate_uncertainty(omega_ref, T_HORIZON, DT, RK4_SUBSTEPS, P0,
-                           k_info, q_process, k_hfi=0.0,
-                           reset_time=None, reset_value=None):
-    """RK4-integrates P_dot = -info_rate(omega_ref(t), k_info, k_hfi)*P +
-    q_process for a prescribed speed profile omega_ref(t), with an optional
+                           params, sigma, q_process,
+                           k_hfi=0.0, reset_time=None, reset_value=None):
+    """RK4-integrates P_dot = -info_rate(omega_ref(t), params, sigma, k_hfi)*P
+    + q_process for a prescribed speed profile omega_ref(t), with an optional
     one-time discrete reset of P at reset_time.
 
     Returns the coarse (N+1)-point grid (t, P) matching the OCP's DT.
@@ -101,7 +101,7 @@ def integrate_uncertainty(omega_ref, T_HORIZON, DT, RK4_SUBSTEPS, P0,
     P_grid[0] = P0
 
     def p_dot(t, P):
-        return -info_rate(omega_ref(t), k_info, k_hfi) * P + q_process
+        return -info_rate(omega_ref(t), params, sigma, k_hfi) * P + q_process
 
     P = P0
     t = 0.0
@@ -134,7 +134,8 @@ def check_feasibility(name, t, omega_m, params):
 
 
 def main():
-    params = PMSMParams()
+    MOTOR = 'BLY172S'  # or 'Teknic2310P' -- see MOTOR_PRESETS in pmsm_casadi.py
+    params = PMSMParams.for_motor(MOTOR)
     TARGET_SPEED = params.N * 0.125
 
     strategies = {}
@@ -142,7 +143,7 @@ def main():
     # 1. Optimal (OCP) -- reuse the actual solver, BEMF info only.
     ocp_results = solve_pmsm_ocp(params, T_HORIZON=T_HORIZON, DT=DT,
                                   RK4_SUBSTEPS=RK4_SUBSTEPS, P0=P0,
-                                  k_info=K_INFO, Q_process=Q_PROCESS)
+                                  sigma=SIGMA, Q_process=Q_PROCESS)
     strategies['optimal'] = {'t': ocp_results['t'], 'omega_m': ocp_results['omega_m'],
                               'P': ocp_results['P']}
 
@@ -151,7 +152,8 @@ def main():
         return linear_ramp_omega(t, TARGET_SPEED, 0.0, T_HORIZON)
 
     t_grid, P_grid = integrate_uncertainty(
-        omega_linear, T_HORIZON, DT, RK4_SUBSTEPS, P0, K_INFO, Q_PROCESS)
+        omega_linear, T_HORIZON, DT, RK4_SUBSTEPS, P0,
+        params, SIGMA, Q_PROCESS)
     strategies['linear_ramp'] = {'t': t_grid, 'omega_m': omega_linear(t_grid), 'P': P_grid}
 
     # 3. Align (hold + discrete P reset) then ramp for the remaining time.
@@ -159,20 +161,22 @@ def main():
         return linear_ramp_omega(t, TARGET_SPEED, T_ALIGN, T_HORIZON)
 
     t_grid, P_grid = integrate_uncertainty(
-        omega_align, T_HORIZON, DT, RK4_SUBSTEPS, P0, K_INFO, Q_PROCESS,
+        omega_align, T_HORIZON, DT, RK4_SUBSTEPS, P0,
+        params, SIGMA, Q_PROCESS,
         reset_time=T_ALIGN, reset_value=P_ALIGN)
     strategies['align_then_ramp'] = {'t': t_grid, 'omega_m': omega_align(t_grid), 'P': P_grid}
 
     # 4. Same naive ramp, plus a constant HFI info contribution.
     t_grid, P_grid = integrate_uncertainty(
-        omega_linear, T_HORIZON, DT, RK4_SUBSTEPS, P0, K_INFO, Q_PROCESS,
-        k_hfi=K_HFI)
+        omega_linear, T_HORIZON, DT, RK4_SUBSTEPS, P0,
+        params, SIGMA, Q_PROCESS, k_hfi=K_HFI)
     strategies['ramp_with_hfi'] = {'t': t_grid, 'omega_m': omega_linear(t_grid), 'P': P_grid}
 
     # 5. Alignment reset + HFI combined, on top of the align-then-ramp profile.
     t_grid, P_grid = integrate_uncertainty(
-        omega_align, T_HORIZON, DT, RK4_SUBSTEPS, P0, K_INFO, Q_PROCESS,
-        k_hfi=K_HFI, reset_time=T_ALIGN, reset_value=P_ALIGN)
+        omega_align, T_HORIZON, DT, RK4_SUBSTEPS, P0,
+        params, SIGMA, Q_PROCESS, k_hfi=K_HFI,
+        reset_time=T_ALIGN, reset_value=P_ALIGN)
     strategies['align_ramp_hfi'] = {'t': t_grid, 'omega_m': omega_align(t_grid), 'P': P_grid}
 
     # ---- Feasibility check (rough) ----

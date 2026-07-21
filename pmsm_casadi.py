@@ -2,6 +2,18 @@ import numpy as np
 import casadi as ca
 
 
+# Named motor presets, mapped onto PMSMParams' fields:
+#   R=Rs, Ld, Lq, lambda_m=FluxPM, p, J, B, N=N_max (rated/max speed), Imax=I_rated.
+# Vmax is bus voltage, not a motor parameter -- not given in a motor's datasheet
+# fields above, so both presets keep the same 24.0 V default unless overridden.
+MOTOR_PRESETS = {
+    'BLY172S': dict(R=0.40, Ld=0.60e-3, Lq=0.60e-3, lambda_m=6.838e-3,
+                     p=4, J=4.802e-6, B=1.0e-6, N=4000, Imax=3.5, Vmax=24.0),
+    'Teknic2310P': dict(R=0.36, Ld=2.0e-4, Lq=2.0e-4, lambda_m=6.4e-3,
+                         p=4, J=7.0616e-6, B=2.6369e-6, N=6000, Imax=7.1, Vmax=24.0),
+}
+
+
 class PMSMParams:
     """Container for PMSM physical parameters (plain numbers, not symbolic)."""
 
@@ -17,6 +29,14 @@ class PMSMParams:
         self.N = N
         self.Imax = Imax
         self.Vmax = Vmax
+
+    @classmethod
+    def for_motor(cls, name):
+        """Builds PMSMParams from a named preset in MOTOR_PRESETS, e.g.
+        PMSMParams.for_motor('Teknic2310P')."""
+        if name not in MOTOR_PRESETS:
+            raise ValueError(f"Unknown motor '{name}'. Available: {list(MOTOR_PRESETS)}")
+        return cls(**MOTOR_PRESETS[name])
 
 
 def pmsm_dynamics(x, u, params):
@@ -54,23 +74,24 @@ def pmsm_dynamics(x, u, params):
     return ca.vertcat(did, diq, domega_m, dtheta_m)
 
 
-def build_dynamics_function(params, k_info=None, Q_process=None):
+def build_dynamics_function(params, sigma=None, Q_process=None):
     """Builds a CasADi function for the PMSM dynamics dx/dt = f(x, u).
 
     By default this builds the plain 4-state plant [id, iq, omega_m, theta_m].
-    Passing both k_info and Q_process augments it with a 5th state, P (the
+    Passing both sigma and Q_process augments it with a 5th state, P (the
     sensorless estimator's rotor-angle variance), giving the 5-state
     [id, iq, omega_m, theta_m, P] used by the OCP: P_dot = -info_rate*P +
-    Q_process, so faster spin-up (higher info_rate, see info_rate()) drives
-    the estimate's uncertainty down faster, while Q_process is a constant
-    floor that keeps it from decaying to zero.
+    Q_process, so a higher BEMF SNR (see info_rate()) drives the estimate's
+    uncertainty down faster, while Q_process is a constant floor that keeps
+    it from decaying to zero.
 
     Parameters
     ----------
     params : PMSMParams
         Physical parameters of the PMSM
-    k_info : float, optional
-        BEMF information-rate gain (see info_rate()). Enables the P state.
+    sigma : float, optional
+        Gaussian measurement-noise standard deviation (see info_rate()).
+        Enables the P state.
     Q_process : float, optional
         Process-noise floor for the P state. Enables the P state.
 
@@ -79,7 +100,7 @@ def build_dynamics_function(params, k_info=None, Q_process=None):
     f : casadi.Function
         CasADi function representing the dynamics dx/dt = f(x, u)
     """
-    with_uncertainty = k_info is not None and Q_process is not None
+    with_uncertainty = sigma is not None and Q_process is not None
     nx = 5 if with_uncertainty else 4
 
     x = ca.SX.sym('x', nx)
@@ -89,7 +110,7 @@ def build_dynamics_function(params, k_info=None, Q_process=None):
 
     if with_uncertainty:
         omega_m, P = x[2], x[4]
-        P_dot = -info_rate(omega_m, k_info) * P + Q_process
+        P_dot = -info_rate(omega_m, params, sigma) * P + Q_process
         xdot = ca.vertcat(dx_plant, P_dot)
     else:
         xdot = dx_plant
@@ -112,19 +133,32 @@ def estimated_dq_currents(i_alpha, i_beta, theta_hat):
     return id_hat, iq_hat
 
 
-def info_rate(omega_m, k_info, k_hfi=0.0):
+def info_rate(omega_m, params, sigma, k_hfi=0.0):
     """Rate at which the estimator gains information about rotor angle.
 
-    BEMF-based observation only works while the rotor is moving, so that
-    contribution grows with speed: k_info * omega_m**2. k_hfi is an optional
-    constant, speed-independent contribution (e.g. a saliency-based
-    high-frequency-injection estimator, which works even at standstill).
+    Noise model: the BEMF-based observer measures a signal of amplitude
+      A = params.lambda_m * params.p * omega_m   -- BEMF magnitude [V],
+          zero at standstill (no BEMF-based info without motion),
+    corrupted by simple additive white Gaussian noise, n ~ N(0, sigma**2),
+    with a single, constant standard deviation sigma [V] -- the standard
+    textbook sensor/ADC noise assumption, regardless of speed.
+
+    The Fisher information rate for estimating a phase from a sinusoidal
+    signal of amplitude A in Gaussian noise of variance sigma**2 is A**2 /
+    sigma**2, giving:
+
+      info_rate = (A / sigma)**2 = (params.lambda_m * params.p * omega_m / sigma)**2
+
+    k_hfi is an optional constant, speed-independent addition (e.g. a
+    saliency-based high-frequency-injection estimator, which works even at
+    standstill, unlike the BEMF term above).
 
     Works with both CasADi symbols and plain numbers/numpy arrays, so this
     is the single source of truth shared between the OCP dynamics below and
     any offline comparison of alternative speed trajectories.
     """
-    return k_info * omega_m ** 2 + k_hfi
+    signal = params.lambda_m * params.p * omega_m
+    return (signal / sigma) ** 2 + k_hfi
 
 
 def rk4_step(f_dyn, x, u, dt):
@@ -200,8 +234,12 @@ def wrap_to_2pi(theta):
 
 
 def solve_pmsm_ocp(params, T_HORIZON=3.0, DT=1e-1, RK4_SUBSTEPS=100,
-                    P0=1.0 ** 2, k_info=2e-6, Q_process=1e-4):
+                    P0=1.0 ** 2, sigma=20.0, Q_process=1e-4):
     """Sets up and solves the PMSM optimal control problem.
+
+    sigma is the Gaussian measurement-noise standard deviation (see
+    info_rate() in this module) that drives how fast the estimation
+    variance P can be reduced by spinning up.
 
     Returns
     -------
@@ -212,7 +250,7 @@ def solve_pmsm_ocp(params, T_HORIZON=3.0, DT=1e-1, RK4_SUBSTEPS=100,
     N = int(round(T_HORIZON / DT))
     TARGET_SPEED = params.N * 0.125
 
-    f_dyn_unc = build_dynamics_function(params, k_info=k_info, Q_process=Q_process)
+    f_dyn_unc = build_dynamics_function(params, sigma=sigma, Q_process=Q_process)
     rk4_integrator = build_rk4_integrator_nd(f_dyn_unc, DT, RK4_SUBSTEPS, nx=5, nu=2)
 
     opti = ca.Opti()
@@ -290,7 +328,8 @@ def save_raw_results(filepath, results):
 
 
 if __name__ == "__main__":
-    params = PMSMParams()
+    MOTOR = 'BLY172S'  # or 'Teknic2310P' -- see MOTOR_PRESETS
+    params = PMSMParams.for_motor(MOTOR)
     results = solve_pmsm_ocp(params, T_HORIZON=3.0, DT=1e-1, RK4_SUBSTEPS=500)
     save_raw_results('pmsm_raw_results.npz', results)
-    print("Raw OCP results saved to pmsm_raw_results.npz")
+    print(f"Raw OCP results saved to pmsm_raw_results.npz (motor={MOTOR})")
